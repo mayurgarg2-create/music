@@ -1,0 +1,12 @@
+aiogram==3.7.0
+pyrogram==2.0.106
+TgCrypto
+py-tgcalls==2.2.0
+yt-dlp
+spotipy
+lyricsgenius
+Pillow
+aiohttp==3.9.5
+requests
+python-dotenv
+pydantic>=2.4.1,<2.8
