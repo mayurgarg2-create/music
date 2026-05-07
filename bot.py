@@ -1,8 +1,11 @@
 """
 ╔══════════════════════════════════════════╗
 ║     👑 ROYAL MUSIC BOT — MAIN ENTRY     ║
-║     Full Premium Telegram Music Bot      ║
 ╚══════════════════════════════════════════╝
+
+CHANGES vs original:
+  • Imports player_callbacks and registers it
+  • play_next() in stream-end handler now passes bot= for card updates
 """
 import asyncio
 from aiogram import Bot, Dispatcher, F
@@ -15,6 +18,7 @@ from player import pyro, calls, now_playing, play_next
 
 # Import all handler modules
 from handlers import music, premium, admin, ai_cmds, download, games, lyrics
+from handlers import player_callbacks          # ← NEW
 
 GOLD = "👑"
 NOTE = "🎵"
@@ -31,6 +35,8 @@ ai_cmds.register(dp, bot, OWNER_ID)
 download.register(dp, bot, OWNER_ID)
 games.register(dp, bot, OWNER_ID)
 lyrics.register(dp, bot, OWNER_ID)
+player_callbacks.register(dp, bot, OWNER_ID)  # ← NEW
+
 
 # ── /start ────────────────────────────────────
 @dp.message(Command("start"))
@@ -71,6 +77,7 @@ async def start_cmd(message: Message):
         f"╚{'═'*32}╝",
         parse_mode="HTML"
     )
+
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
@@ -126,6 +133,7 @@ async def help_cmd(message: Message):
         parse_mode="HTML"
     )
 
+
 # ── Auto-register group when bot added ────────
 @dp.my_chat_member()
 async def on_chat_member(update):
@@ -133,19 +141,14 @@ async def on_chat_member(update):
     if chat.type in ("group", "supergroup") and update.new_chat_member.status in ("member", "administrator"):
         register_group(chat.id, chat.title or "")
 
-# ── Stream end → play next ────────────────────
-# py-tgcalls 2.x uses @calls.on_update() with type checking
-# We inspect available types at runtime to stay version-agnostic
 
+# ── Stream end → play next ────────────────────
 def _find_stream_end_class():
-    """Return the stream-ended update class for whatever pytgcalls version is installed."""
     import pytgcalls.types as pt
-    # Known class names across versions — try each
     for name in ("GroupCallEnded", "StreamEnded", "StreamAudioEnded", "AudioEnded"):
         cls = getattr(pt, name, None)
         if cls is not None:
             return cls
-    # Try submodule
     try:
         import pytgcalls.types.stream as pts
         for name in ("GroupCallEnded", "StreamEnded", "StreamAudioEnded", "AudioEnded"):
@@ -159,7 +162,6 @@ def _find_stream_end_class():
 _StreamEndClass = _find_stream_end_class()
 
 if _StreamEndClass is not None:
-    # New API: on_update fires for all events — filter by type
     @calls.on_update()
     async def on_stream_end(client, update):
         if not isinstance(update, _StreamEndClass):
@@ -169,10 +171,9 @@ if _StreamEndClass is not None:
         if chat_id in now_playing:
             play_history.setdefault(chat_id, []).append(now_playing[chat_id])
             now_playing.pop(chat_id, None)
-        await play_next(chat_id)
+        # ── pass bot so the next track's now-playing card is sent ──────────
+        await play_next(chat_id, bot=bot)   # ← bot added here
 else:
-    # Absolute fallback: poll-based stream end detection
-    # This fires play_next whenever a chat stops playing but queue is non-empty
     print("⚠️  pytgcalls stream-end event not found — using polling fallback")
 
     async def _stream_end_poller():
@@ -180,7 +181,6 @@ else:
         while True:
             await asyncio.sleep(5)
             for chat_id in list(now_playing.keys()):
-                # If pytgcalls reports idle but we still have now_playing set, advance queue
                 try:
                     status = await calls.get_call(chat_id)
                     if status is None:
@@ -188,9 +188,10 @@ else:
                         if chat_id in now_playing:
                             play_history.setdefault(chat_id, []).append(now_playing[chat_id])
                             now_playing.pop(chat_id, None)
-                        await play_next(chat_id)
+                        await play_next(chat_id, bot=bot)   # ← bot added here
                 except Exception:
                     pass
+
 
 # ── Main ──────────────────────────────────────
 async def main():
@@ -210,6 +211,7 @@ async def main():
 
     print("✅ Bot is running! Press Ctrl+C to stop.\n")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
