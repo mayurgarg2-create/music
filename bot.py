@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════╗
-║     👑 ROYAL MUSIC BOT — MAIN ENTRY     ║
-║     Full Premium Telegram Music Bot      ║
+║    👑 ROYAL MUSIC BOT — MAIN ENTRY      ║
+║    Full Premium Telegram Music Bot       ║
 ╚══════════════════════════════════════════╝
 """
 
@@ -228,4 +228,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # ── EVENT LOOP FIX: Share the same loop for Pyrogram and Aiogram ──
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped gracefully.")
