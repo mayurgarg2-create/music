@@ -1,12 +1,11 @@
 FROM python:3.11-slim
 
-# Install ffmpeg (required for audio streaming)
+# Install ffmpeg and nodejs (required for yt-dlp extraction)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     git \
     curl \
-    && ffmpeg -version \
-    && ffprobe -version \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -19,6 +18,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 CMD ["python", "bot.py"]
-# nixpacks.toml
-[phases.setup]
-nixPkgs = ["deno"]
