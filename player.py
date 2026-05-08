@@ -1,15 +1,11 @@
 """
 Audio Engine — yt-dlp + PyTgCalls + FFmpeg
 320kbps premium quality streaming
-
-FIXES APPLIED:
-  1. YouTube bot-detection bypass via cookies file (cookies.txt)
-  2. NoActiveGroupCall → properly joins VC before retrying stream
-  3. Now-playing card sent with inline control buttons
 """
 import asyncio
 import os
 import time
+import random
 import yt_dlp
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -17,6 +13,7 @@ from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality
 from pytgcalls.exceptions import NoActiveGroupCall
+from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import (
@@ -41,21 +38,21 @@ sp = (
 )
 
 # ══════════════════════════════════════════════
-#  COOKIES PATH  (FIX 1 — YouTube bot detection)
+#  COOKIES  (YouTube bot-detection bypass)
 # ══════════════════════════════════════════════
-# Export cookies from your browser after signing into YouTube:
-#   yt-dlp --cookies-from-browser chrome --skip-download "https://youtube.com"
-#   → saves cookies.txt  (or export manually via browser extension)
-# Place cookies.txt next to this file OR set COOKIES_PATH in your env.
-COOKIES_PATH = os.environ.get("COOKIES_PATH", "cookies.txt")
+# Export via: yt-dlp --cookies-from-browser chrome --skip-download https://youtube.com
+# Place cookies.txt next to this file OR set COOKIES_PATH env var.
+COOKIES_PATH   = os.environ.get("COOKIES_PATH", "cookies.txt")
 _COOKIES_EXIST = os.path.isfile(COOKIES_PATH)
 
 if not _COOKIES_EXIST:
     print(
-        "⚠️  cookies.txt not found — YouTube may block requests.\n"
-        "   Export via:  yt-dlp --cookies-from-browser chrome --skip-download https://youtube.com\n"
-        f"   Then place at: {os.path.abspath(COOKIES_PATH)}"
+        "⚠️  cookies.txt NOT found — YouTube will block most requests!\n"
+        "   Run: yt-dlp --cookies-from-browser chrome --skip-download https://youtube.com\n"
+        f"   Then place cookies.txt here: {os.path.abspath(COOKIES_PATH)}"
     )
+else:
+    print(f"✅ cookies.txt loaded from {os.path.abspath(COOKIES_PATH)}")
 
 
 def _ydl_opts(extra: dict = None) -> dict:
@@ -65,7 +62,6 @@ def _ydl_opts(extra: dict = None) -> dict:
         "no_warnings":    True,
         "source_address": "0.0.0.0",
         "geo_bypass":     True,
-        # ── FIX 1: pass cookies file when it exists ──────────────────────
         **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
     }
     if extra:
@@ -83,26 +79,25 @@ stream_start = {}   # chat_id -> timestamp
 vote_skips   = {}   # chat_id -> set(user_ids)
 search_cache = {}   # chat_id -> [results]
 game_audio   = {}   # chat_id -> audio_url for guess game
-
-# Stores (bot, message_id) of now-playing cards so we can edit them
-np_messages  = {}   # chat_id -> (bot_instance, message_id)
+np_messages  = {}   # chat_id -> (bot, message_id)
+loop_status  = {}   # chat_id -> bool
+volume_cache = {}   # chat_id -> int (1-200)
 
 
 # ══════════════════════════════════════════════
-#  NOW-PLAYING INLINE KEYBOARD  (FIX 3)
+#  NOW-PLAYING CARD + INLINE KEYBOARD
 # ══════════════════════════════════════════════
 def player_keyboard() -> InlineKeyboardMarkup:
-    """Inline control buttons shown on the now-playing card."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⏸ Pause",   callback_data="player_pause"),
-            InlineKeyboardButton(text="▶️ Resume",  callback_data="player_resume"),
-            InlineKeyboardButton(text="⏭ Skip",    callback_data="player_skip"),
+            InlineKeyboardButton(text="⏸ Pause",    callback_data="player_pause"),
+            InlineKeyboardButton(text="▶️ Resume",   callback_data="player_resume"),
+            InlineKeyboardButton(text="⏭ Skip",     callback_data="player_skip"),
         ],
         [
-            InlineKeyboardButton(text="🔁 Loop",   callback_data="player_loop"),
-            InlineKeyboardButton(text="🔀 Shuffle", callback_data="player_shuffle"),
-            InlineKeyboardButton(text="⏹ Stop",    callback_data="player_stop"),
+            InlineKeyboardButton(text="🔁 Loop",    callback_data="player_loop"),
+            InlineKeyboardButton(text="🔀 Shuffle",  callback_data="player_shuffle"),
+            InlineKeyboardButton(text="⏹ Stop",     callback_data="player_stop"),
         ],
         [
             InlineKeyboardButton(text="🔉 Vol -10", callback_data="player_vol_down"),
@@ -112,42 +107,34 @@ def player_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def send_now_playing_card(
-    bot,
-    chat_id: int,
-    track: dict,
-    elapsed: int = 0,
-) -> None:
-    """
-    Send (or edit) the now-playing card with inline buttons.
-    Stores the message reference in np_messages so it can be updated later.
-    """
+async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: int = 0) -> None:
     total   = track.get("duration", 0)
     bar     = progress_bar(elapsed, total)
-    elapsed_str = duration_str(elapsed)
-    total_str   = duration_str(total)
-    thumb   = track.get("thumb", "")
     title   = track.get("title", "Unknown")
-    artist  = track.get("artist", "")
+    artist  = track.get("artist", "Unknown")
     source  = track.get("source", "YouTube")
+    thumb   = track.get("thumb", "")
+    loop_on = loop_status.get(chat_id, False)
+    q_count = len(queues.get(chat_id, []))
 
     caption = (
         f"╔══「 👑 <b>NOW PLAYING</b> 」══╗\n\n"
         f"  🎵 <b>{title}</b>\n"
-        f"  👤 {artist or 'Unknown'}\n"
-        f"  📡 Source: {source}\n\n"
+        f"  👤 {artist}\n"
+        f"  📡 Source: {source}\n"
+        f"  🔁 Loop: {'✅ ON' if loop_on else '❌ OFF'} | 📋 Queue: {q_count}\n\n"
         f"  {bar}\n"
-        f"  ⏱ {elapsed_str} / {total_str}\n\n"
-        f"╚{'═'*30}╝"
+        f"  ⏱ {duration_str(elapsed)} / {duration_str(total)}\n\n"
+        f"╚{'═' * 30}╝"
     )
     kb = player_keyboard()
 
     try:
-        # If we already have a card, try to edit it
+        # Try editing existing card
         if chat_id in np_messages:
-            _, msg_id = np_messages[chat_id]
+            stored_bot, msg_id = np_messages[chat_id]
             try:
-                await bot.edit_message_caption(
+                await stored_bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=msg_id,
                     caption=caption,
@@ -156,9 +143,9 @@ async def send_now_playing_card(
                 )
                 return
             except Exception:
-                pass  # Fall through to send a fresh card
+                pass  # fall through to send fresh
 
-        # Send a fresh card (with photo if thumb is available)
+        # Send fresh card
         if thumb:
             msg = await bot.send_photo(
                 chat_id=chat_id,
@@ -184,9 +171,8 @@ async def send_now_playing_card(
 # ══════════════════════════════════════════════
 async def yt_search(query: str, max_results: int = 5) -> list[dict]:
     """
-    Search YouTube and return a list of track metadata dicts.
-    Uses extract_flat=True so we only fetch metadata (fast).
-    The actual stream URL is resolved later in get_fresh_url().
+    Search YouTube and return metadata list.
+    Uses extract_flat for speed — stream URL resolved later by get_fresh_url().
     """
     opts = _ydl_opts({
         "extract_flat":   True,
@@ -203,7 +189,7 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
             for e in (info.get("entries") or []):
                 if not e:
                     continue
-                vid_id = e.get("id", "")
+                vid_id      = e.get("id", "")
                 webpage_url = (
                     e.get("webpage_url")
                     or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else "")
@@ -212,11 +198,11 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
                     continue
 
                 thumb = ""
-                raw_thumb = e.get("thumbnail") or e.get("thumbnails")
-                if isinstance(raw_thumb, list) and raw_thumb:
-                    thumb = raw_thumb[-1].get("url", "")
-                elif isinstance(raw_thumb, str):
-                    thumb = raw_thumb
+                raw   = e.get("thumbnail") or e.get("thumbnails")
+                if isinstance(raw, list) and raw:
+                    thumb = raw[-1].get("url", "")
+                elif isinstance(raw, str):
+                    thumb = raw
 
                 results.append({
                     "title":       e.get("title", "Unknown"),
@@ -234,17 +220,12 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 # ══════════════════════════════════════════════
-#  STREAM URL RESOLVER  (FIX 1 continued)
+#  STREAM URL RESOLVER
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
-    """
-    Given a YouTube watch URL, extract a fresh direct audio stream URL.
-    Called right before PyTgCalls starts streaming.
-    Cookies are injected automatically via _ydl_opts().
-    """
+    """Extract a fresh direct audio stream URL from a YouTube watch URL."""
     if not webpage_url:
         return None
-
     opts = _ydl_opts({"format": "bestaudio/best"})
     loop = asyncio.get_event_loop()
     try:
@@ -292,33 +273,27 @@ async def resolve_spotify(url: str):
 
 
 # ══════════════════════════════════════════════
-#  STREAM ENGINE  (FIX 2 — proper VC join)
+#  VOICE CHAT JOIN HELPER
 # ══════════════════════════════════════════════
-async def _join_and_play(chat_id: int, stream: "MediaStream") -> bool:
-    """
-    Attempt to play in VC. If NoActiveGroupCall, create the call first,
-    then retry. Returns True on success.
-    """
+async def _join_and_play(chat_id: int, stream) -> bool:
+    """Play in VC. If no active call exists, create one then retry."""
     try:
         await calls.play(chat_id, stream)
         return True
     except NoActiveGroupCall:
-        # ── FIX 2: join the voice chat via Pyrogram, then retry ──────────
         try:
-            # Start a group call if none exists (requires Pyrogram)
+            from pyrogram.raw.functions.phone import CreateGroupCall
             await pyro.invoke(
-                __import__("pyrogram.raw.functions.phone", fromlist=["CreateGroupCall"])
-                .CreateGroupCall(
+                CreateGroupCall(
                     peer=await pyro.resolve_peer(chat_id),
-                    random_id=__import__("random").randint(1000, 9999),
+                    random_id=random.randint(10000, 99999),
                 )
             )
-            await asyncio.sleep(1)          # let Telegram register the call
+            await asyncio.sleep(2)
             await calls.play(chat_id, stream)
             return True
         except Exception as ex:
-            print(f"[JOIN_VC CREATE_CALL ERROR] {ex}")
-            # Last resort: just retry play once more (works if call already existed)
+            print(f"[JOIN_VC CreateGroupCall ERROR] {ex}")
             try:
                 await calls.play(chat_id, stream)
                 return True
@@ -330,11 +305,14 @@ async def _join_and_play(chat_id: int, stream: "MediaStream") -> bool:
         return False
 
 
+# ══════════════════════════════════════════════
+#  STREAM ENGINE
+# ══════════════════════════════════════════════
 async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
     """Resolve stream URL and start/change playback in the voice chat."""
     audio_url = await get_fresh_url(track.get("webpage_url") or track.get("url", ""))
     if not audio_url:
-        print(f"[STREAM_TRACK] Could not resolve audio URL for: {track.get('title')}")
+        print(f"[STREAM_TRACK] No audio URL for: {track.get('title')}")
         return False
 
     premium = is_group_premium(chat_id)
@@ -348,7 +326,7 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
             ffmpeg_parameters=ffmpeg_params,
         )
     except TypeError:
-        # Older py-tgcalls versions don't support ffmpeg_parameters
+        # Older py-tgcalls without ffmpeg_parameters support
         stream = MediaStream(audio_url, audio_parameters=quality)
 
     ok = await _join_and_play(chat_id, stream)
@@ -357,26 +335,22 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
     return ok
 
 
-async def play_next(chat_id: int, bot=None) -> dict | None:
-    """
-    Play the next track in queue.
-    Pass `bot` to send/update the now-playing card automatically.
-    Returns the track played or None.
-    """
+async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
+    """Play the next track in queue. Pass bot= to auto-send now-playing card."""
     s = get_settings(chat_id)
 
-    if s["loop"] and chat_id in now_playing:
+    if loop_status.get(chat_id, False) and chat_id in now_playing:
         track = now_playing[chat_id]
 
     elif s.get("loop_queue") and not queues.get(chat_id) and play_history.get(chat_id):
-        queues[chat_id] = list(play_history.get(chat_id, []))
+        queues[chat_id] = list(play_history[chat_id])
         track = queues[chat_id].pop(0)
         _save_history(chat_id)
         now_playing[chat_id] = track
 
     else:
         if not queues.get(chat_id):
-            if not s["mode_247"]:
+            if not s.get("mode_247"):
                 now_playing.pop(chat_id, None)
                 np_messages.pop(chat_id, None)
                 try:
@@ -394,9 +368,9 @@ async def play_next(chat_id: int, bot=None) -> dict | None:
         now_playing.pop(chat_id, None)
         return await play_next(chat_id, bot=bot)
 
-    # ── FIX 3: send now-playing card with inline buttons ─────────────────
+    # Resolve bot from cache if not passed directly
     if bot is None and chat_id in np_messages:
-        bot, _ = np_messages[chat_id]   # reuse stored bot instance
+        bot, _ = np_messages[chat_id]
     if bot:
         await send_now_playing_card(bot, chat_id, track)
 
@@ -404,7 +378,6 @@ async def play_next(chat_id: int, bot=None) -> dict | None:
 
 
 def _save_history(chat_id: int):
-    """Save current now_playing to history before switching."""
     if chat_id in now_playing:
         hist = play_history.setdefault(chat_id, [])
         hist.append(now_playing[chat_id])
@@ -412,15 +385,14 @@ def _save_history(chat_id: int):
             hist.pop(0)
 
 
-async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot=None) -> str:
+async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = None) -> str:
     """
-    Add a track to the queue or start playing immediately.
-    Pass `bot` so the now-playing card is sent when playback starts.
+    Add track to queue or start playing immediately.
     Returns: 'playing' | 'queued' | 'full' | 'duplicate' | 'error'
     """
     s  = get_settings(chat_id)
     q  = queues.setdefault(chat_id, [])
-    mx = s.get("max_queue", 20)
+    mx = s.get("max_queue", 50)
 
     if s.get("duplicate_check"):
         all_titles = (
