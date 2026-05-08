@@ -1,2 +1,5 @@
 [phases.setup]
-nixPkgs = ["deno"]
+nixPkgs = ["python311", "ffmpeg", "nodejs"]
+
+[start]
+cmd = "python bot.py"
