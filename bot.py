@@ -4,6 +4,22 @@
 ║     Full Premium Telegram Music Bot      ║
 ╚══════════════════════════════════════════╝
 """
+
+# ── Cookie setup (must run before yt-dlp is used anywhere) ───────────
+import os, base64
+
+_cookie_b64 = os.environ.get("COOKIES_B64", "")
+if _cookie_b64:
+    try:
+        with open("cookies.txt", "w") as _f:
+            _f.write(base64.b64decode(_cookie_b64).decode("utf-8"))
+        print("✅ cookies.txt written from COOKIES_B64")
+    except Exception as _e:
+        print(f"⚠️  Failed to write cookies.txt: {_e}")
+else:
+    print("⚠️  COOKIES_B64 not set — YouTube may block requests")
+# ─────────────────────────────────────────────────────────────────────
+
 import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
