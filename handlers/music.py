@@ -406,7 +406,7 @@ async def mode_247_cmd(message: Message):
     chat_id = message.chat.id
     s       = get_settings(chat_id)
     new_val = not s.get("mode_247", False)
-    update_settings(chat_id, mode_247=new_val)
+    update_settings(chat_id, "mode_247", int(new_val))
     await message.reply(
         f"🕐 24/7 mode is now <b>{'ON' if new_val else 'OFF'}</b>\n"
         f"{'Bot will stay in VC even when queue is empty.' if new_val else 'Bot will leave VC when queue is empty.'}",
