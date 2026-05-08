@@ -40,8 +40,6 @@ sp = (
 
 # ══════════════════════════════════════════════
 #  COOKIES SETUP
-#  Railway  → set COOKIES_B64 environment variable
-#  VPS      → place cookies.txt next to this file
 # ══════════════════════════════════════════════
 COOKIES_PATH  = os.environ.get("COOKIES_PATH", "cookies.txt")
 _cookies_b64  = os.environ.get("COOKIES_B64", "")
@@ -67,7 +65,6 @@ else:
 
 
 def _ydl_opts(extra: dict = None) -> dict:
-    """Base yt-dlp options, always injecting cookies when available."""
     opts = {
         "quiet":          True,
         "no_warnings":    True,
@@ -83,20 +80,20 @@ def _ydl_opts(extra: dict = None) -> dict:
 # ══════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════
-queues       = {}   # chat_id -> [track, ...]
-now_playing  = {}   # chat_id -> track dict
-play_history = {}   # chat_id -> [track, ...]
-stream_start = {}   # chat_id -> timestamp
-vote_skips   = {}   # chat_id -> set(user_ids)
-search_cache = {}   # chat_id -> [results]
-game_audio   = {}   # chat_id -> audio_url for guess game
-np_messages  = {}   # chat_id -> (bot, message_id)
-loop_status  = {}   # chat_id -> bool
-volume_cache = {}   # chat_id -> int (1-200)
+queues       = {}
+now_playing  = {}
+play_history = {}
+stream_start = {}
+vote_skips   = {}
+search_cache = {}
+game_audio   = {}
+np_messages  = {}
+loop_status  = {}
+volume_cache = {}
 
 
 # ══════════════════════════════════════════════
-#  NOW-PLAYING CARD + INLINE KEYBOARD
+#  NOW-PLAYING CARD
 # ══════════════════════════════════════════════
 def player_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -141,7 +138,6 @@ async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: in
     kb = player_keyboard()
 
     try:
-        # Try editing existing card first
         if chat_id in np_messages:
             stored_bot, msg_id = np_messages[chat_id]
             try:
@@ -154,9 +150,8 @@ async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: in
                 )
                 return
             except Exception:
-                pass  # fall through to send fresh
+                pass
 
-        # Send fresh card
         if thumb:
             msg = await bot.send_photo(
                 chat_id=chat_id,
@@ -181,10 +176,6 @@ async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: in
 #  YT-DLP SEARCH
 # ══════════════════════════════════════════════
 async def yt_search(query: str, max_results: int = 5) -> list[dict]:
-    """
-    Search YouTube and return metadata list.
-    Uses extract_flat for speed — stream URL resolved later by get_fresh_url().
-    """
     opts = _ydl_opts({
         "extract_flat":   True,
         "default_search": "ytsearch",
@@ -234,7 +225,6 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
 #  STREAM URL RESOLVER
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
-    """Extract a fresh direct audio stream URL from a YouTube watch URL."""
     if not webpage_url:
         return None
     opts = _ydl_opts({"format": "bestaudio/best"})
@@ -292,6 +282,7 @@ async def _join_and_play(chat_id: int, stream) -> bool:
         await calls.play(chat_id, stream)
         return True
     except NoActiveGroupCall:
+        print(f"[JOIN_VC] No active group call in {chat_id}, creating one...")
         try:
             from pyrogram.raw.functions.phone import CreateGroupCall
             await pyro.invoke(
@@ -300,11 +291,13 @@ async def _join_and_play(chat_id: int, stream) -> bool:
                     random_id=random.randint(10000, 99999),
                 )
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             await calls.play(chat_id, stream)
+            print(f"[JOIN_VC] Successfully joined VC in {chat_id}")
             return True
         except Exception as ex:
             print(f"[JOIN_VC CreateGroupCall ERROR] {ex}")
+            # Final retry
             try:
                 await calls.play(chat_id, stream)
                 return True
@@ -346,7 +339,7 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
 
 
 async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
-    """Play the next track in queue. Pass bot= to auto-send now-playing card."""
+    """Play the next track in queue."""
     s = get_settings(chat_id)
 
     if loop_status.get(chat_id, False) and chat_id in now_playing:
@@ -378,7 +371,6 @@ async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
         now_playing.pop(chat_id, None)
         return await play_next(chat_id, bot=bot)
 
-    # Resolve bot from cache if not passed directly
     if bot is None and chat_id in np_messages:
         bot, _ = np_messages[chat_id]
     if bot:
@@ -395,15 +387,22 @@ def _save_history(chat_id: int):
             hist.pop(0)
 
 
+# ══════════════════════════════════════════════
+#  ADD TO QUEUE  ← MAIN FIX HERE
+# ══════════════════════════════════════════════
 async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = None) -> str:
     """
     Add track to queue or start playing immediately.
     Returns: 'playing' | 'queued' | 'full' | 'duplicate' | 'error'
+
+    FIX: If chat_id is in now_playing but stream is dead/stale,
+         clear it and restart instead of queueing.
     """
     s  = get_settings(chat_id)
     q  = queues.setdefault(chat_id, [])
     mx = s.get("max_queue", 50)
 
+    # ── Duplicate check ───────────────────────────────────────────────────────
     if s.get("duplicate_check"):
         all_titles = (
             [now_playing[chat_id]["title"]] if chat_id in now_playing else []
@@ -411,19 +410,41 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
         if track["title"] in all_titles:
             return "duplicate"
 
+    # ── Queue full ────────────────────────────────────────────────────────────
     if len(q) >= mx:
         return "full"
 
-    if chat_id not in now_playing:
-        now_playing[chat_id] = track
-        record_play(chat_id, track["title"])
-        ok = await stream_track(chat_id, track)
-        if ok and bot:
+    # ── Check if already "playing" but VC is actually dead ───────────────────
+    if chat_id in now_playing:
+        try:
+            # Check if bot is actually in a call
+            active = await calls.get_call(chat_id)
+            if active is None:
+                raise Exception("No active call")
+            # VC is alive → queue the track
+            q.append(track)
+            return "queued"
+        except Exception:
+            # VC is dead/stale → clear state and play fresh
+            print(f"[ADD_TO_QUEUE] Stale VC state detected for {chat_id}, clearing and replaying...")
+            now_playing.pop(chat_id, None)
+            queues[chat_id] = []
+            np_messages.pop(chat_id, None)
+            stream_start.pop(chat_id, None)
+
+    # ── Play immediately ──────────────────────────────────────────────────────
+    now_playing[chat_id] = track
+    record_play(chat_id, track["title"])
+    ok = await stream_track(chat_id, track)
+
+    if ok:
+        if bot:
             await send_now_playing_card(bot, chat_id, track)
-        return "playing" if ok else "error"
+        return "playing"
     else:
-        q.append(track)
-        return "queued"
+        # Stream failed — clean up so next /play doesn't get stuck
+        now_playing.pop(chat_id, None)
+        return "error"
 
 
 async def seek_track(chat_id: int, seconds: int) -> bool:
