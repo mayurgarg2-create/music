@@ -193,6 +193,9 @@ def update_setting(chat_id, key, val):
         cursor.execute(f"UPDATE group_settings SET {key}=? WHERE chat_id=?", (val, chat_id))
     conn.commit()
 
+# Alias for backward compatibility (some modules import update_settings)
+update_settings = update_setting
+
 # ══════════════════════════════════════════════
 #  PREMIUM — GROUP
 # ══════════════════════════════════════════════
