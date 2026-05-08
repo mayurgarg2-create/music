@@ -19,3 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 CMD ["python", "bot.py"]
+# nixpacks.toml
+[phases.setup]
+nixPkgs = ["deno"]
