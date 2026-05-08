@@ -73,7 +73,6 @@ def _ydl_opts(extra: dict = None) -> dict:
         "extractor_retries": 5,
         "fragment_retries":  5,
         "no_color":          True,
-        # Standard user agent to look more "human"
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
     }
@@ -81,9 +80,8 @@ def _ydl_opts(extra: dict = None) -> dict:
         opts.update(extra)
     return opts
 
-
 # ══════════════════════════════════════════════
-#  STATE & KEYBOARD (No changes here)
+#  STATE & KEYBOARD
 # ══════════════════════════════════════════════
 queues        = {}
 now_playing   = {}
@@ -175,7 +173,6 @@ async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: in
     except Exception as ex:
         print(f"[NOW_PLAYING_CARD ERROR] {ex}")
 
-
 # ══════════════════════════════════════════════
 #  YT-DLP SEARCH
 # ══════════════════════════════════════════════
@@ -219,20 +216,17 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
         print(f"[YT_SEARCH ERROR] {ex}")
         return []
 
-
 # ══════════════════════════════════════════════
-#  STREAM URL RESOLVER (FIXED!)
+#  STREAM URL RESOLVER
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
     if not webpage_url:
         return None
 
-    # Simplified format chain: Best audio first, then anything with audio
     fmt = "bestaudio/best"
     
     opts = _ydl_opts({
         "format": fmt,
-        # Removed the skip dash/hls arguments as they were causing the error
     })
 
     loop = asyncio.get_event_loop()
@@ -245,12 +239,9 @@ async def get_fresh_url(webpage_url: str) -> str | None:
             if info.get("entries"):
                 info = info["entries"][0]
 
-            # Try to get the direct URL first
             url = info.get("url")
-            if url:
-                return url
+            if url: return url
 
-            # Fallback to formats list if needed
             for f in reversed(info.get("formats", [])):
                 if f.get("acodec") not in (None, "none") and f.get("url"):
                     return f["url"]
@@ -260,9 +251,8 @@ async def get_fresh_url(webpage_url: str) -> str | None:
     
     return None
 
-
 # ══════════════════════════════════════════════
-#  SPOTIFY RESOLVER (No changes)
+#  SPOTIFY RESOLVER
 # ══════════════════════════════════════════════
 async def resolve_spotify(url: str):
     if not sp:
@@ -284,20 +274,27 @@ async def resolve_spotify(url: str):
         return None, str(ex)
     return None, "Unsupported Spotify URL."
 
-
 # ══════════════════════════════════════════════
-#  VOICE CHAT JOIN HELPER (Loop fix applied)
+#  VOICE CHAT JOIN HELPER (AUTO-JOIN FIX)
 # ══════════════════════════════════════════════
 async def _join_and_play(chat_id: int, stream) -> bool:
     try:
         if chat_id in _active_calls:
-            await calls.change_stream(chat_id, stream)
-        else:
-            await calls.play(chat_id, stream)
+            try:
+                await calls.change_stream(chat_id, stream)
+                return True
+            except Exception as e:
+                # If changing the stream fails (e.g. VC was manually closed by admin),
+                # we discard the active call and proceed to start a fresh one.
+                print(f"[_JOIN_AND_PLAY] Stream change failed, starting fresh: {e}")
+                _active_calls.discard(chat_id)
+        
+        await calls.play(chat_id, stream)
         _active_calls.add(chat_id)
         return True
 
     except NoActiveGroupCall:
+        print(f"[JOIN_VC] Auto-creating Voice Chat for {chat_id}")
         try:
             from pyrogram.raw.functions.phone import CreateGroupCall
             await pyro.invoke(
@@ -315,7 +312,6 @@ async def _join_and_play(chat_id: int, stream) -> bool:
             return False
 
     except Exception as ex:
-        # If already playing, just change stream
         if "already" in str(ex).lower():
             try:
                 await calls.change_stream(chat_id, stream)
@@ -325,14 +321,12 @@ async def _join_and_play(chat_id: int, stream) -> bool:
         print(f"[STREAM ERROR] {ex}")
         return False
 
-
 # ══════════════════════════════════════════════
 #  STREAM ENGINE
 # ══════════════════════════════════════════════
 async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
     audio_url = await get_fresh_url(track.get("webpage_url") or track.get("url", ""))
-    if not audio_url:
-        return False
+    if not audio_url: return False
 
     is_premium = is_group_premium(chat_id)
     quality = AudioQuality.HIGH if is_premium else AudioQuality.MEDIUM
@@ -353,7 +347,7 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
     return ok
 
 # ══════════════════════════════════════════════
-#  QUEUE & HELPERS (No changes here)
+#  QUEUE & HELPERS
 # ══════════════════════════════════════════════
 async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
     s = get_settings(chat_id)
@@ -406,9 +400,26 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
 
     if len(q) >= mx: return "full"
 
-    if chat_id in now_playing and chat_id in _active_calls:
+    # ── STATE MISMATCH CHECK ──
+    # Actively verify if the bot is truly connected to the voice chat
+    is_active = False
+    try:
+        if await calls.get_call(chat_id):
+            is_active = True
+    except Exception:
+        pass
+
+    # If the bot is playing and the call is verified alive, add to queue
+    if chat_id in now_playing and is_active:
         q.append(track)
         return "queued"
+
+    # If we get here, either nothing is playing OR the VC was manually closed.
+    # We wipe the stale memory but leave their queue intact.
+    if not is_active:
+        _active_calls.discard(chat_id)
+        now_playing.pop(chat_id, None)
+        stream_start.pop(chat_id, None)
 
     now_playing[chat_id] = track
     record_play(chat_id, track["title"])
