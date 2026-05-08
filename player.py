@@ -4,6 +4,7 @@ Audio Engine — yt-dlp + PyTgCalls + FFmpeg
 """
 import asyncio
 import os
+import base64
 import time
 import random
 import yt_dlp
@@ -38,21 +39,31 @@ sp = (
 )
 
 # ══════════════════════════════════════════════
-#  COOKIES  (YouTube bot-detection bypass)
+#  COOKIES SETUP
+#  Railway  → set COOKIES_B64 environment variable
+#  VPS      → place cookies.txt next to this file
 # ══════════════════════════════════════════════
-# Export via: yt-dlp --cookies-from-browser chrome --skip-download https://youtube.com
-# Place cookies.txt next to this file OR set COOKIES_PATH env var.
-COOKIES_PATH   = os.environ.get("COOKIES_PATH", "cookies.txt")
+COOKIES_PATH  = os.environ.get("COOKIES_PATH", "cookies.txt")
+_cookies_b64  = os.environ.get("COOKIES_B64", "")
+
+if _cookies_b64:
+    try:
+        with open(COOKIES_PATH, "w") as _f:
+            _f.write(base64.b64decode(_cookies_b64).decode())
+        print("✅ cookies.txt written from COOKIES_B64 env var")
+    except Exception as _ex:
+        print(f"⚠️  Failed to decode COOKIES_B64: {_ex}")
+
 _COOKIES_EXIST = os.path.isfile(COOKIES_PATH)
 
-if not _COOKIES_EXIST:
-    print(
-        "⚠️  cookies.txt NOT found — YouTube will block most requests!\n"
-        "   Run: yt-dlp --cookies-from-browser chrome --skip-download https://youtube.com\n"
-        f"   Then place cookies.txt here: {os.path.abspath(COOKIES_PATH)}"
-    )
+if _COOKIES_EXIST:
+    print(f"✅ cookies.txt ready → {os.path.abspath(COOKIES_PATH)}")
 else:
-    print(f"✅ cookies.txt loaded from {os.path.abspath(COOKIES_PATH)}")
+    print(
+        "⚠️  cookies.txt NOT found — YouTube will block requests!\n"
+        "   Railway: add COOKIES_B64 variable in Railway → Variables tab\n"
+        "   VPS: place cookies.txt next to player.py"
+    )
 
 
 def _ydl_opts(extra: dict = None) -> dict:
@@ -130,7 +141,7 @@ async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: in
     kb = player_keyboard()
 
     try:
-        # Try editing existing card
+        # Try editing existing card first
         if chat_id in np_messages:
             stored_bot, msg_id = np_messages[chat_id]
             try:
@@ -326,7 +337,6 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
             ffmpeg_parameters=ffmpeg_params,
         )
     except TypeError:
-        # Older py-tgcalls without ffmpeg_parameters support
         stream = MediaStream(audio_url, audio_parameters=quality)
 
     ok = await _join_and_play(chat_id, stream)
