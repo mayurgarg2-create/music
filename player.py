@@ -41,13 +41,21 @@ sp = (
 # ══════════════════════════════════════════════
 #  COOKIES SETUP
 # ══════════════════════════════════════════════
-COOKIES_PATH  = os.environ.get("COOKIES_PATH", "cookies.txt")
-_cookies_b64  = os.environ.get("COOKIES_B64", "")
+COOKIES_PATH = os.environ.get("COOKIES_PATH", "cookies.txt")
+_cookies_b64 = os.environ.get("COOKIES_B64", "")
 
 if _cookies_b64:
     try:
-        with open(COOKIES_PATH, "w") as _f:
-            _f.write(base64.b64decode(_cookies_b64).decode())
+        # Fix padding if needed
+        _cookies_b64 += "=" * (-len(_cookies_b64) % 4)
+        decoded = base64.b64decode(_cookies_b64)
+        # Try utf-8 first, fall back to latin-1
+        try:
+            text = decoded.decode("utf-8")
+        except UnicodeDecodeError:
+            text = decoded.decode("latin-1")
+        with open(COOKIES_PATH, "w", encoding="utf-8") as _f:
+            _f.write(text)
         print("✅ cookies.txt written from COOKIES_B64 env var")
     except Exception as _ex:
         print(f"⚠️  Failed to decode COOKIES_B64: {_ex}")
@@ -64,12 +72,17 @@ else:
     )
 
 
+# ══════════════════════════════════════════════
+#  YT-DLP OPTIONS — single definition, no duplicate
+# ══════════════════════════════════════════════
 def _ydl_opts(extra: dict = None) -> dict:
     opts = {
-        "quiet":          True,
-        "no_warnings":    True,
-        "source_address": "0.0.0.0",
-        "geo_bypass":     True,
+        "quiet":             True,
+        "no_warnings":       True,
+        "source_address":    "0.0.0.0",
+        "geo_bypass":        True,
+        "extractor_retries": 3,
+        "fragment_retries":  3,
         **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
     }
     if extra:
@@ -80,17 +93,17 @@ def _ydl_opts(extra: dict = None) -> dict:
 # ══════════════════════════════════════════════
 #  STATE
 # ══════════════════════════════════════════════
-queues       = {}
-now_playing  = {}
-play_history = {}
-stream_start = {}
-vote_skips   = {}
-search_cache = {}
-game_audio   = {}
-np_messages  = {}
-loop_status  = {}
-volume_cache = {}
-_active_calls = set()   # FIX #3 — manual VC state tracker
+queues        = {}
+now_playing   = {}
+play_history  = {}
+stream_start  = {}
+vote_skips    = {}
+search_cache  = {}
+game_audio    = {}
+np_messages   = {}
+loop_status   = {}
+volume_cache  = {}
+_active_calls = set()
 
 
 # ══════════════════════════════════════════════
@@ -99,14 +112,14 @@ _active_calls = set()   # FIX #3 — manual VC state tracker
 def player_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="⏸ Pause",    callback_data="player_pause"),
-            InlineKeyboardButton(text="▶️ Resume",   callback_data="player_resume"),
-            InlineKeyboardButton(text="⏭ Skip",     callback_data="player_skip"),
+            InlineKeyboardButton(text="⏸ Pause",   callback_data="player_pause"),
+            InlineKeyboardButton(text="▶️ Resume",  callback_data="player_resume"),
+            InlineKeyboardButton(text="⏭ Skip",    callback_data="player_skip"),
         ],
         [
-            InlineKeyboardButton(text="🔁 Loop",    callback_data="player_loop"),
-            InlineKeyboardButton(text="🔀 Shuffle",  callback_data="player_shuffle"),
-            InlineKeyboardButton(text="⏹ Stop",     callback_data="player_stop"),
+            InlineKeyboardButton(text="🔁 Loop",   callback_data="player_loop"),
+            InlineKeyboardButton(text="🔀 Shuffle", callback_data="player_shuffle"),
+            InlineKeyboardButton(text="⏹ Stop",    callback_data="player_stop"),
         ],
         [
             InlineKeyboardButton(text="🔉 Vol -10", callback_data="player_vol_down"),
@@ -223,18 +236,12 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 # ══════════════════════════════════════════════
-#  FIX #1 — STREAM URL RESOLVER (was breaking /play)
+#  STREAM URL RESOLVER
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
-    """
-    FIXED: Use proper format selector chain so yt-dlp never throws
-    'Requested format is not available'.
-    Prefer webm/opus (best for Telegram VC), fall back to any audio.
-    """
     if not webpage_url:
         return None
 
-    # Try formats in order of preference
     format_chains = [
         "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/best",
         "bestaudio/best",
@@ -246,7 +253,6 @@ async def get_fresh_url(webpage_url: str) -> str | None:
     for fmt in format_chains:
         opts = _ydl_opts({
             "format": fmt,
-            # These extra opts prevent many YouTube 403/format errors
             "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
         })
         try:
@@ -263,7 +269,6 @@ async def get_fresh_url(webpage_url: str) -> str | None:
                     print(f"[GET_FRESH_URL] Got URL with format: {fmt}")
                     return url
 
-                # Fallback: scan formats list manually
                 for f in reversed(info.get("formats", [])):
                     if f.get("acodec") not in (None, "none") and f.get("url"):
                         print(f"[GET_FRESH_URL] Got URL from formats list")
@@ -309,16 +314,11 @@ async def resolve_spotify(url: str):
 
 
 # ══════════════════════════════════════════════
-#  FIX #2 — VOICE CHAT JOIN HELPER
+#  VOICE CHAT JOIN HELPER
 # ══════════════════════════════════════════════
 async def _join_and_play(chat_id: int, stream) -> bool:
-    """
-    FIXED: Track active calls in _active_calls set ourselves.
-    Don't rely on calls.get_call() which doesn't exist in all versions.
-    """
     try:
         if chat_id in _active_calls:
-            # Already in call — just change the stream
             await calls.change_stream(chat_id, stream)
         else:
             await calls.play(chat_id, stream)
@@ -353,7 +353,6 @@ async def _join_and_play(chat_id: int, stream) -> bool:
 
     except Exception as ex:
         err = str(ex)
-        # Handle "already playing" — just change stream
         if "already" in err.lower() or "playing" in err.lower():
             try:
                 await calls.change_stream(chat_id, stream)
@@ -371,7 +370,6 @@ async def _join_and_play(chat_id: int, stream) -> bool:
 #  STREAM ENGINE
 # ══════════════════════════════════════════════
 async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
-    """Resolve stream URL and start/change playback in the voice chat."""
     audio_url = await get_fresh_url(track.get("webpage_url") or track.get("url", ""))
     if not audio_url:
         print(f"[STREAM_TRACK] No audio URL for: {track.get('title')}")
@@ -397,7 +395,6 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
 
 
 async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
-    """Play the next track in queue."""
     s = get_settings(chat_id)
 
     if loop_status.get(chat_id, False) and chat_id in now_playing:
@@ -447,19 +444,13 @@ def _save_history(chat_id: int):
 
 
 # ══════════════════════════════════════════════
-#  FIX #3 — ADD TO QUEUE (was crashing on get_call)
+#  ADD TO QUEUE
 # ══════════════════════════════════════════════
 async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = None) -> str:
-    """
-    FIXED: Replaced calls.get_call() (doesn't exist in all PyTgCalls versions)
-    with _active_calls set which we manage ourselves.
-    Returns: 'playing' | 'queued' | 'full' | 'duplicate' | 'error'
-    """
     s  = get_settings(chat_id)
     q  = queues.setdefault(chat_id, [])
     mx = s.get("max_queue", 50)
 
-    # ── Duplicate check ───────────────────────────────────────────────────────
     if s.get("duplicate_check"):
         all_titles = (
             [now_playing[chat_id]["title"]] if chat_id in now_playing else []
@@ -467,16 +458,13 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
         if track["title"] in all_titles:
             return "duplicate"
 
-    # ── Queue full ────────────────────────────────────────────────────────────
     if len(q) >= mx:
         return "full"
 
-    # ── Already playing → queue the new track ────────────────────────────────
     if chat_id in now_playing and chat_id in _active_calls:
         q.append(track)
         return "queued"
 
-    # ── State is stale (playing dict exists but VC is dead) → clear and replay
     if chat_id in now_playing and chat_id not in _active_calls:
         print(f"[ADD_TO_QUEUE] Stale state for {chat_id}, clearing...")
         now_playing.pop(chat_id, None)
@@ -484,7 +472,6 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
         np_messages.pop(chat_id, None)
         stream_start.pop(chat_id, None)
 
-    # ── Play immediately ──────────────────────────────────────────────────────
     now_playing[chat_id] = track
     record_play(chat_id, track["title"])
     ok = await stream_track(chat_id, track)
@@ -522,17 +509,7 @@ def duration_str(sec) -> str:
     m, s = divmod(int(sec), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-    
-def _ydl_opts(extra: dict = None) -> dict:
-    opts = {
-        "quiet":          True,
-        "no_warnings":    True,
-        "source_address": "0.0.0.0",
-        "geo_bypass":     True,
-        "extractor_retries": 3,        # ← ADD THIS
-        "fragment_retries":  3,        # ← ADD THIS
-        **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
-    }
+
 
 def progress_bar(elapsed: int, total: int, length: int = 14) -> str:
     if not total:
