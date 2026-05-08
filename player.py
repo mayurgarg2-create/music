@@ -522,7 +522,17 @@ def duration_str(sec) -> str:
     m, s = divmod(int(sec), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
+    
+def _ydl_opts(extra: dict = None) -> dict:
+    opts = {
+        "quiet":          True,
+        "no_warnings":    True,
+        "source_address": "0.0.0.0",
+        "geo_bypass":     True,
+        "extractor_retries": 3,        # ← ADD THIS
+        "fragment_retries":  3,        # ← ADD THIS
+        **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
+    }
 
 def progress_bar(elapsed: int, total: int, length: int = 14) -> str:
     if not total:
