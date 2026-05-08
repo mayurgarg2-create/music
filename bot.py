@@ -1,14 +1,11 @@
 """
 ╔══════════════════════════════════════════╗
 ║     👑 ROYAL MUSIC BOT — MAIN ENTRY     ║
+║     Full Premium Telegram Music Bot      ║
 ╚══════════════════════════════════════════╝
-
-CHANGES vs original:
-  • Imports player_callbacks and registers it
-  • play_next() in stream-end handler now passes bot= for card updates
 """
 import asyncio
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -18,10 +15,9 @@ from player import pyro, calls, now_playing, play_next
 
 # Import all handler modules
 from handlers import music, premium, admin, ai_cmds, download, games, lyrics
-from handlers import player_callbacks          # ← NEW
+from handlers import player_callbacks   # ← inline button handler
 
 GOLD = "👑"
-NOTE = "🎵"
 
 # ── Init bot & dispatcher ─────────────────────
 bot = Bot(token=BOT_TOKEN)
@@ -35,7 +31,7 @@ ai_cmds.register(dp, bot, OWNER_ID)
 download.register(dp, bot, OWNER_ID)
 games.register(dp, bot, OWNER_ID)
 lyrics.register(dp, bot, OWNER_ID)
-player_callbacks.register(dp, bot, OWNER_ID)  # ← NEW
+player_callbacks.register(dp, bot, OWNER_ID)   # ← register inline buttons
 
 
 # ── /start ────────────────────────────────────
@@ -74,7 +70,7 @@ async def start_cmd(message: Message):
         f"  /buy — Get premium with ⭐ Stars\n"
         f"  /mystatus — Check your status\n\n"
         f"  /help — Full command list\n\n"
-        f"╚{'═'*32}╝",
+        f"╚{'═' * 32}╝",
         parse_mode="HTML"
     )
 
@@ -129,21 +125,23 @@ async def help_cmd(message: Message):
         f"/broadcast — Message all groups\n"
         f"/stats — Bot statistics\n"
         f"/revenue — Payment stats\n\n"
-        f"╚{'═'*32}╝",
+        f"╚{'═' * 32}╝",
         parse_mode="HTML"
     )
 
 
-# ── Auto-register group when bot added ────────
+# ── Auto-register group when bot is added ─────
 @dp.my_chat_member()
 async def on_chat_member(update):
     chat = update.chat
-    if chat.type in ("group", "supergroup") and update.new_chat_member.status in ("member", "administrator"):
+    if chat.type in ("group", "supergroup") and \
+       update.new_chat_member.status in ("member", "administrator"):
         register_group(chat.id, chat.title or "")
 
 
 # ── Stream end → play next ────────────────────
 def _find_stream_end_class():
+    """Return the stream-ended update class for whatever pytgcalls version is installed."""
     import pytgcalls.types as pt
     for name in ("GroupCallEnded", "StreamEnded", "StreamAudioEnded", "AudioEnded"):
         cls = getattr(pt, name, None)
@@ -159,6 +157,7 @@ def _find_stream_end_class():
         pass
     return None
 
+
 _StreamEndClass = _find_stream_end_class()
 
 if _StreamEndClass is not None:
@@ -171,8 +170,7 @@ if _StreamEndClass is not None:
         if chat_id in now_playing:
             play_history.setdefault(chat_id, []).append(now_playing[chat_id])
             now_playing.pop(chat_id, None)
-        # ── pass bot so the next track's now-playing card is sent ──────────
-        await play_next(chat_id, bot=bot)   # ← bot added here
+        await play_next(chat_id, bot=bot)   # bot passed → auto sends now-playing card
 else:
     print("⚠️  pytgcalls stream-end event not found — using polling fallback")
 
@@ -188,7 +186,7 @@ else:
                         if chat_id in now_playing:
                             play_history.setdefault(chat_id, []).append(now_playing[chat_id])
                             now_playing.pop(chat_id, None)
-                        await play_next(chat_id, bot=bot)   # ← bot added here
+                        await play_next(chat_id, bot=bot)
                 except Exception:
                     pass
 
