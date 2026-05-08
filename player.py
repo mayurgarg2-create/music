@@ -90,6 +90,7 @@ game_audio   = {}
 np_messages  = {}
 loop_status  = {}
 volume_cache = {}
+_active_calls = set()   # FIX #3 — manual VC state tracker
 
 
 # ══════════════════════════════════════════════
@@ -222,31 +223,65 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 # ══════════════════════════════════════════════
-#  STREAM URL RESOLVER
+#  FIX #1 — STREAM URL RESOLVER (was breaking /play)
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
+    """
+    FIXED: Use proper format selector chain so yt-dlp never throws
+    'Requested format is not available'.
+    Prefer webm/opus (best for Telegram VC), fall back to any audio.
+    """
     if not webpage_url:
         return None
-    opts = _ydl_opts({"format": "bestaudio/best"})
+
+    # Try formats in order of preference
+    format_chains = [
+        "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/best",
+        "bestaudio/best",
+        "best",
+    ]
+
     loop = asyncio.get_event_loop()
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = await loop.run_in_executor(
-                None,
-                lambda: ydl.extract_info(webpage_url, download=False)
-            )
-            if info.get("entries"):
-                info = info["entries"][0]
-            url = info.get("url")
-            if not url:
-                for fmt in reversed(info.get("formats", [])):
-                    if fmt.get("acodec") != "none" and fmt.get("url"):
-                        url = fmt["url"]
-                        break
-            return url
-    except Exception as ex:
-        print(f"[GET_FRESH_URL ERROR] {ex}")
-        return None
+
+    for fmt in format_chains:
+        opts = _ydl_opts({
+            "format": fmt,
+            # These extra opts prevent many YouTube 403/format errors
+            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = await loop.run_in_executor(
+                    None,
+                    lambda: ydl.extract_info(webpage_url, download=False)
+                )
+                if info.get("entries"):
+                    info = info["entries"][0]
+
+                url = info.get("url")
+                if url:
+                    print(f"[GET_FRESH_URL] Got URL with format: {fmt}")
+                    return url
+
+                # Fallback: scan formats list manually
+                for f in reversed(info.get("formats", [])):
+                    if f.get("acodec") not in (None, "none") and f.get("url"):
+                        print(f"[GET_FRESH_URL] Got URL from formats list")
+                        return f["url"]
+
+        except yt_dlp.utils.DownloadError as ex:
+            err = str(ex)
+            if "Requested format is not available" in err or "No video formats" in err:
+                print(f"[GET_FRESH_URL] Format '{fmt}' failed, trying next...")
+                continue
+            print(f"[GET_FRESH_URL ERROR] {ex}")
+            return None
+        except Exception as ex:
+            print(f"[GET_FRESH_URL ERROR] {ex}")
+            return None
+
+    print(f"[GET_FRESH_URL] All format chains exhausted for: {webpage_url}")
+    return None
 
 
 # ══════════════════════════════════════════════
@@ -274,13 +309,22 @@ async def resolve_spotify(url: str):
 
 
 # ══════════════════════════════════════════════
-#  VOICE CHAT JOIN HELPER
+#  FIX #2 — VOICE CHAT JOIN HELPER
 # ══════════════════════════════════════════════
 async def _join_and_play(chat_id: int, stream) -> bool:
-    """Play in VC. If no active call exists, create one then retry."""
+    """
+    FIXED: Track active calls in _active_calls set ourselves.
+    Don't rely on calls.get_call() which doesn't exist in all versions.
+    """
     try:
-        await calls.play(chat_id, stream)
+        if chat_id in _active_calls:
+            # Already in call — just change the stream
+            await calls.change_stream(chat_id, stream)
+        else:
+            await calls.play(chat_id, stream)
+        _active_calls.add(chat_id)
         return True
+
     except NoActiveGroupCall:
         print(f"[JOIN_VC] No active group call in {chat_id}, creating one...")
         try:
@@ -293,19 +337,33 @@ async def _join_and_play(chat_id: int, stream) -> bool:
             )
             await asyncio.sleep(3)
             await calls.play(chat_id, stream)
+            _active_calls.add(chat_id)
             print(f"[JOIN_VC] Successfully joined VC in {chat_id}")
             return True
         except Exception as ex:
             print(f"[JOIN_VC CreateGroupCall ERROR] {ex}")
-            # Final retry
+            _active_calls.discard(chat_id)
             try:
                 await calls.play(chat_id, stream)
+                _active_calls.add(chat_id)
                 return True
             except Exception as ex2:
                 print(f"[JOIN_VC FINAL RETRY ERROR] {ex2}")
                 return False
+
     except Exception as ex:
+        err = str(ex)
+        # Handle "already playing" — just change stream
+        if "already" in err.lower() or "playing" in err.lower():
+            try:
+                await calls.change_stream(chat_id, stream)
+                _active_calls.add(chat_id)
+                return True
+            except Exception as ex3:
+                print(f"[CHANGE_STREAM ERROR] {ex3}")
+                return False
         print(f"[STREAM ERROR] {ex}")
+        _active_calls.discard(chat_id)
         return False
 
 
@@ -356,6 +414,7 @@ async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
             if not s.get("mode_247"):
                 now_playing.pop(chat_id, None)
                 np_messages.pop(chat_id, None)
+                _active_calls.discard(chat_id)
                 try:
                     await calls.leave_group_call(chat_id)
                 except Exception:
@@ -388,15 +447,13 @@ def _save_history(chat_id: int):
 
 
 # ══════════════════════════════════════════════
-#  ADD TO QUEUE  ← MAIN FIX HERE
+#  FIX #3 — ADD TO QUEUE (was crashing on get_call)
 # ══════════════════════════════════════════════
 async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = None) -> str:
     """
-    Add track to queue or start playing immediately.
+    FIXED: Replaced calls.get_call() (doesn't exist in all PyTgCalls versions)
+    with _active_calls set which we manage ourselves.
     Returns: 'playing' | 'queued' | 'full' | 'duplicate' | 'error'
-
-    FIX: If chat_id is in now_playing but stream is dead/stale,
-         clear it and restart instead of queueing.
     """
     s  = get_settings(chat_id)
     q  = queues.setdefault(chat_id, [])
@@ -414,23 +471,18 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
     if len(q) >= mx:
         return "full"
 
-    # ── Check if already "playing" but VC is actually dead ───────────────────
-    if chat_id in now_playing:
-        try:
-            # Check if bot is actually in a call
-            active = await calls.get_call(chat_id)
-            if active is None:
-                raise Exception("No active call")
-            # VC is alive → queue the track
-            q.append(track)
-            return "queued"
-        except Exception:
-            # VC is dead/stale → clear state and play fresh
-            print(f"[ADD_TO_QUEUE] Stale VC state detected for {chat_id}, clearing and replaying...")
-            now_playing.pop(chat_id, None)
-            queues[chat_id] = []
-            np_messages.pop(chat_id, None)
-            stream_start.pop(chat_id, None)
+    # ── Already playing → queue the new track ────────────────────────────────
+    if chat_id in now_playing and chat_id in _active_calls:
+        q.append(track)
+        return "queued"
+
+    # ── State is stale (playing dict exists but VC is dead) → clear and replay
+    if chat_id in now_playing and chat_id not in _active_calls:
+        print(f"[ADD_TO_QUEUE] Stale state for {chat_id}, clearing...")
+        now_playing.pop(chat_id, None)
+        queues[chat_id] = []
+        np_messages.pop(chat_id, None)
+        stream_start.pop(chat_id, None)
 
     # ── Play immediately ──────────────────────────────────────────────────────
     now_playing[chat_id] = track
@@ -442,7 +494,6 @@ async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = N
             await send_now_playing_card(bot, chat_id, track)
         return "playing"
     else:
-        # Stream failed — clean up so next /play doesn't get stuck
         now_playing.pop(chat_id, None)
         return "error"
 
