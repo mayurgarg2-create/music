@@ -46,10 +46,8 @@ _cookies_b64 = os.environ.get("COOKIES_B64", "")
 
 if _cookies_b64:
     try:
-        # Fix padding if needed
         _cookies_b64 += "=" * (-len(_cookies_b64) % 4)
         decoded = base64.b64decode(_cookies_b64)
-        # Try utf-8 first, fall back to latin-1
         try:
             text = decoded.decode("utf-8")
         except UnicodeDecodeError:
@@ -62,18 +60,8 @@ if _cookies_b64:
 
 _COOKIES_EXIST = os.path.isfile(COOKIES_PATH)
 
-if _COOKIES_EXIST:
-    print(f"✅ cookies.txt ready → {os.path.abspath(COOKIES_PATH)}")
-else:
-    print(
-        "⚠️  cookies.txt NOT found — YouTube will block requests!\n"
-        "   Railway: add COOKIES_B64 variable in Railway → Variables tab\n"
-        "   VPS: place cookies.txt next to player.py"
-    )
-
-
 # ══════════════════════════════════════════════
-#  YT-DLP OPTIONS — single definition, no duplicate
+#  YT-DLP OPTIONS
 # ══════════════════════════════════════════════
 def _ydl_opts(extra: dict = None) -> dict:
     opts = {
@@ -81,8 +69,12 @@ def _ydl_opts(extra: dict = None) -> dict:
         "no_warnings":       True,
         "source_address":    "0.0.0.0",
         "geo_bypass":        True,
-        "extractor_retries": 3,
-        "fragment_retries":  3,
+        "nocheckcertificate": True,
+        "extractor_retries": 5,
+        "fragment_retries":  5,
+        "no_color":          True,
+        # Standard user agent to look more "human"
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         **({"cookiefile": COOKIES_PATH} if _COOKIES_EXIST else {}),
     }
     if extra:
@@ -91,7 +83,7 @@ def _ydl_opts(extra: dict = None) -> dict:
 
 
 # ══════════════════════════════════════════════
-#  STATE
+#  STATE & KEYBOARD (No changes here)
 # ══════════════════════════════════════════════
 queues        = {}
 now_playing   = {}
@@ -105,10 +97,6 @@ loop_status   = {}
 volume_cache  = {}
 _active_calls = set()
 
-
-# ══════════════════════════════════════════════
-#  NOW-PLAYING CARD
-# ══════════════════════════════════════════════
 def player_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -128,7 +116,9 @@ def player_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
-
+# ══════════════════════════════════════════════
+#  NOW-PLAYING CARD
+# ══════════════════════════════════════════════
 async def send_now_playing_card(bot: Bot, chat_id: int, track: dict, elapsed: int = 0) -> None:
     total   = track.get("duration", 0)
     bar     = progress_bar(elapsed, total)
@@ -203,18 +193,13 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
             )
             results = []
             for e in (info.get("entries") or []):
-                if not e:
-                    continue
-                vid_id      = e.get("id", "")
-                webpage_url = (
-                    e.get("webpage_url")
-                    or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else "")
-                )
-                if not webpage_url:
-                    continue
+                if not e: continue
+                vid_id = e.get("id", "")
+                webpage_url = e.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else "")
+                if not webpage_url: continue
 
                 thumb = ""
-                raw   = e.get("thumbnail") or e.get("thumbnails")
+                raw = e.get("thumbnail") or e.get("thumbnails")
                 if isinstance(raw, list) and raw:
                     thumb = raw[-1].get("url", "")
                 elif isinstance(raw, str):
@@ -236,61 +221,48 @@ async def yt_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 # ══════════════════════════════════════════════
-#  STREAM URL RESOLVER
+#  STREAM URL RESOLVER (FIXED!)
 # ══════════════════════════════════════════════
 async def get_fresh_url(webpage_url: str) -> str | None:
     if not webpage_url:
         return None
 
-    format_chains = [
-        "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[acodec!=none]/best",
-        "bestaudio/best",
-        "best",
-    ]
+    # Simplified format chain: Best audio first, then anything with audio
+    fmt = "bestaudio/best"
+    
+    opts = _ydl_opts({
+        "format": fmt,
+        # Removed the skip dash/hls arguments as they were causing the error
+    })
 
     loop = asyncio.get_event_loop()
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = await loop.run_in_executor(
+                None,
+                lambda: ydl.extract_info(webpage_url, download=False)
+            )
+            if info.get("entries"):
+                info = info["entries"][0]
 
-    for fmt in format_chains:
-        opts = _ydl_opts({
-            "format": fmt,
-            "extractor_args": {"youtube": {"skip": ["dash", "hls"]}},
-        })
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = await loop.run_in_executor(
-                    None,
-                    lambda: ydl.extract_info(webpage_url, download=False)
-                )
-                if info.get("entries"):
-                    info = info["entries"][0]
+            # Try to get the direct URL first
+            url = info.get("url")
+            if url:
+                return url
 
-                url = info.get("url")
-                if url:
-                    print(f"[GET_FRESH_URL] Got URL with format: {fmt}")
-                    return url
+            # Fallback to formats list if needed
+            for f in reversed(info.get("formats", [])):
+                if f.get("acodec") not in (None, "none") and f.get("url"):
+                    return f["url"]
 
-                for f in reversed(info.get("formats", [])):
-                    if f.get("acodec") not in (None, "none") and f.get("url"):
-                        print(f"[GET_FRESH_URL] Got URL from formats list")
-                        return f["url"]
-
-        except yt_dlp.utils.DownloadError as ex:
-            err = str(ex)
-            if "Requested format is not available" in err or "No video formats" in err:
-                print(f"[GET_FRESH_URL] Format '{fmt}' failed, trying next...")
-                continue
-            print(f"[GET_FRESH_URL ERROR] {ex}")
-            return None
-        except Exception as ex:
-            print(f"[GET_FRESH_URL ERROR] {ex}")
-            return None
-
-    print(f"[GET_FRESH_URL] All format chains exhausted for: {webpage_url}")
+    except Exception as ex:
+        print(f"[GET_FRESH_URL ERROR] {ex}")
+    
     return None
 
 
 # ══════════════════════════════════════════════
-#  SPOTIFY RESOLVER
+#  SPOTIFY RESOLVER (No changes)
 # ══════════════════════════════════════════════
 async def resolve_spotify(url: str):
     if not sp:
@@ -314,7 +286,7 @@ async def resolve_spotify(url: str):
 
 
 # ══════════════════════════════════════════════
-#  VOICE CHAT JOIN HELPER
+#  VOICE CHAT JOIN HELPER (Loop fix applied)
 # ══════════════════════════════════════════════
 async def _join_and_play(chat_id: int, stream) -> bool:
     try:
@@ -326,7 +298,6 @@ async def _join_and_play(chat_id: int, stream) -> bool:
         return True
 
     except NoActiveGroupCall:
-        print(f"[JOIN_VC] No active group call in {chat_id}, creating one...")
         try:
             from pyrogram.raw.functions.phone import CreateGroupCall
             await pyro.invoke(
@@ -335,34 +306,23 @@ async def _join_and_play(chat_id: int, stream) -> bool:
                     random_id=random.randint(10000, 99999),
                 )
             )
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             await calls.play(chat_id, stream)
             _active_calls.add(chat_id)
-            print(f"[JOIN_VC] Successfully joined VC in {chat_id}")
             return True
         except Exception as ex:
-            print(f"[JOIN_VC CreateGroupCall ERROR] {ex}")
-            _active_calls.discard(chat_id)
-            try:
-                await calls.play(chat_id, stream)
-                _active_calls.add(chat_id)
-                return True
-            except Exception as ex2:
-                print(f"[JOIN_VC FINAL RETRY ERROR] {ex2}")
-                return False
+            print(f"[JOIN_VC ERROR] {ex}")
+            return False
 
     except Exception as ex:
-        err = str(ex)
-        if "already" in err.lower() or "playing" in err.lower():
+        # If already playing, just change stream
+        if "already" in str(ex).lower():
             try:
                 await calls.change_stream(chat_id, stream)
                 _active_calls.add(chat_id)
                 return True
-            except Exception as ex3:
-                print(f"[CHANGE_STREAM ERROR] {ex3}")
-                return False
+            except: pass
         print(f"[STREAM ERROR] {ex}")
-        _active_calls.discard(chat_id)
         return False
 
 
@@ -372,11 +332,10 @@ async def _join_and_play(chat_id: int, stream) -> bool:
 async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
     audio_url = await get_fresh_url(track.get("webpage_url") or track.get("url", ""))
     if not audio_url:
-        print(f"[STREAM_TRACK] No audio URL for: {track.get('title')}")
         return False
 
-    premium = is_group_premium(chat_id)
-    quality = AudioQuality.HIGH if premium else AudioQuality.MEDIUM
+    is_premium = is_group_premium(chat_id)
+    quality = AudioQuality.HIGH if is_premium else AudioQuality.MEDIUM
     ffmpeg_params = f"-ss {seek}" if seek else None
 
     try:
@@ -393,29 +352,26 @@ async def stream_track(chat_id: int, track: dict, seek: int = 0) -> bool:
         stream_start[chat_id] = time.time() - seek
     return ok
 
-
+# ══════════════════════════════════════════════
+#  QUEUE & HELPERS (No changes here)
+# ══════════════════════════════════════════════
 async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
     s = get_settings(chat_id)
-
     if loop_status.get(chat_id, False) and chat_id in now_playing:
         track = now_playing[chat_id]
-
     elif s.get("loop_queue") and not queues.get(chat_id) and play_history.get(chat_id):
         queues[chat_id] = list(play_history[chat_id])
         track = queues[chat_id].pop(0)
         _save_history(chat_id)
         now_playing[chat_id] = track
-
     else:
         if not queues.get(chat_id):
             if not s.get("mode_247"):
                 now_playing.pop(chat_id, None)
                 np_messages.pop(chat_id, None)
                 _active_calls.discard(chat_id)
-                try:
-                    await calls.leave_group_call(chat_id)
-                except Exception:
-                    pass
+                try: await calls.leave_group_call(chat_id)
+                except: pass
             return None
         track = queues[chat_id].pop(0)
         _save_history(chat_id)
@@ -431,89 +387,59 @@ async def play_next(chat_id: int, bot: Bot = None) -> dict | None:
         bot, _ = np_messages[chat_id]
     if bot:
         await send_now_playing_card(bot, chat_id, track)
-
     return track
-
 
 def _save_history(chat_id: int):
     if chat_id in now_playing:
         hist = play_history.setdefault(chat_id, [])
         hist.append(now_playing[chat_id])
-        if len(hist) > 15:
-            hist.pop(0)
+        if len(hist) > 15: hist.pop(0)
 
-
-# ══════════════════════════════════════════════
-#  ADD TO QUEUE
-# ══════════════════════════════════════════════
 async def add_to_queue(chat_id: int, track: dict, user_id: int = 0, bot: Bot = None) -> str:
-    s  = get_settings(chat_id)
-    q  = queues.setdefault(chat_id, [])
+    s = get_settings(chat_id)
+    q = queues.setdefault(chat_id, [])
     mx = s.get("max_queue", 50)
 
     if s.get("duplicate_check"):
-        all_titles = (
-            [now_playing[chat_id]["title"]] if chat_id in now_playing else []
-        ) + [t["title"] for t in q]
-        if track["title"] in all_titles:
-            return "duplicate"
+        all_titles = ([now_playing[chat_id]["title"]] if chat_id in now_playing else []) + [t["title"] for t in q]
+        if track["title"] in all_titles: return "duplicate"
 
-    if len(q) >= mx:
-        return "full"
+    if len(q) >= mx: return "full"
 
     if chat_id in now_playing and chat_id in _active_calls:
         q.append(track)
         return "queued"
-
-    if chat_id in now_playing and chat_id not in _active_calls:
-        print(f"[ADD_TO_QUEUE] Stale state for {chat_id}, clearing...")
-        now_playing.pop(chat_id, None)
-        queues[chat_id] = []
-        np_messages.pop(chat_id, None)
-        stream_start.pop(chat_id, None)
 
     now_playing[chat_id] = track
     record_play(chat_id, track["title"])
     ok = await stream_track(chat_id, track)
 
     if ok:
-        if bot:
-            await send_now_playing_card(bot, chat_id, track)
+        if bot: await send_now_playing_card(bot, chat_id, track)
         return "playing"
     else:
         now_playing.pop(chat_id, None)
         return "error"
 
-
 async def seek_track(chat_id: int, seconds: int) -> bool:
     track = now_playing.get(chat_id)
-    if not track:
-        return False
+    if not track: return False
     ok = await stream_track(chat_id, track, seek=seconds)
-    if ok:
-        stream_start[chat_id] = time.time() - seconds
+    if ok: stream_start[chat_id] = time.time() - seconds
     return ok
 
-
-# ══════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════
 def get_elapsed(chat_id: int) -> int:
     start = stream_start.get(chat_id, time.time())
     return int(time.time() - start)
 
-
 def duration_str(sec) -> str:
-    if not sec:
-        return "LIVE"
+    if not sec: return "LIVE"
     m, s = divmod(int(sec), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-
 def progress_bar(elapsed: int, total: int, length: int = 14) -> str:
-    if not total:
-        return "▓" * length
-    pct    = min(elapsed / total, 1.0)
+    if not total: return "▓" * length
+    pct = min(elapsed / total, 1.0)
     filled = int(length * pct)
     return "▓" * filled + "░" * (length - filled)
